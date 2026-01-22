@@ -1,1 +1,1 @@
-# Navigation-World-Model-with-Sptio-temporal-Prior
+# Navigation World Model with Sptio-temporal Prior
