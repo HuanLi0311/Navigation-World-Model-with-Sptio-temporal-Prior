@@ -1,0 +1,52 @@
+# Copy of eval_config.yaml with updated data paths
+trajectory_eval_distance:
+  min_dist_cat: 8
+  max_dist_cat: 8
+trajectory_eval_len_traj_pred: 8
+trajectory_eval_context_size: 4
+traj_stride: 8
+
+# distance bounds for distance and action and distance predictions 
+eval_distance:
+  eval_min_dist_cat: -64
+  eval_max_dist_cat: 64
+eval_len_traj_pred: 64
+eval_context_size: 4
+
+results_dir: /home/JJ_Group/lih2511/GDiT/nwm/config
+run_name: cdit_xl
+model: CDiT-XL/2
+image_size: 224
+normalize: true
+context_size: 4
+
+# Updated data paths
+eval_datasets:
+  recon:
+    data_folder: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/test/
+    test: data_splits/recon/test/
+    goals_per_obs: 4
+  tartan_drive:
+    data_folder: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/test/
+    test: data_splits/tartan_drive/test/
+    goals_per_obs: 4
+  sacson:
+    data_folder: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/test/
+    test: data_splits/sacson/test
+    goals_per_obs: 4
+  scand:
+    data_folder: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/test/
+    test: data_splits/scand/test
+    goals_per_obs: 4
+  go_stanford:
+    data_folder: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/test/
+    test: data_splits/go_stanford/test/
+    goals_per_obs: 4
+  tartan2.0:
+    data_folder: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/test/
+    test: data_splits/tartan2.0/test/
+    goals_per_obs: 4
+  waymo:
+    data_folder: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/test/
+    test: data_splits/waymo/test/
+    goals_per_obs: 4

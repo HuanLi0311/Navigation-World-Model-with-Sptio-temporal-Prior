@@ -1,0 +1,20 @@
+# Ignore large files and directories
+config/cdit_b/
+config/cdit_l/
+InfiniteVGGT/ckpt/
+
+# Ignore Python bytecode
+__pycache__/
+*.pyc
+
+# Ignore IDE files
+.vscode/
+.idea/
+
+# Ignore temporary files
+*.tmp
+*.temp
+
+# Ignore logs
+logs/
+*.log
