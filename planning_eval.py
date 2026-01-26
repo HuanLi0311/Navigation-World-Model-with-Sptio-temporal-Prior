@@ -194,7 +194,7 @@ class WM_Planning_Evaluator:
         model.to(self.device)
         self.model = torch.compile(model)
         self.diffusion = create_diffusion(str(250))
-        self.vae = AutoencoderKL.from_pretrained("/home/JJ_Group/lih2511/GDiT/nwm/config/cdit_xl/checkpoints/sd-vae-ema", local_files_only=True).to(device)
+        self.vae = AutoencoderKL.from_pretrained("/home/lih2511/GDiT/config/cdit_l/checkpoints/sd-vae-ema", local_files_only=True).to(device)
         self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.device], find_unused_parameters=False)
         self.model_without_ddp = self.model.module
          

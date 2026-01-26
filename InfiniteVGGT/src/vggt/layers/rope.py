@@ -151,6 +151,7 @@ class RotaryPositionEmbedding2D(nn.Module):
         # Apply rotation
         return (tokens * cos) + (self._rotate_features(tokens) * sin)
 
+    @torch._dynamo.disable
     def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Applies 2D rotary position embeddings to input tokens.
 

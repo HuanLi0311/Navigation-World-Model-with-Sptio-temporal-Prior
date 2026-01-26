@@ -43,25 +43,30 @@ class BaseDataset(Dataset):
         self.goals_per_obs = goals_per_obs
 
 
+
+        # 读取traj_names.txt作为轨迹名列表，并自动过滤缺失轨迹
         traj_names_file = os.path.join(data_split_folder, traj_names)
+        if not os.path.exists(traj_names_file):
+            raise RuntimeError(f"traj_names.txt not found in {data_split_folder}")
         with open(traj_names_file, "r") as f:
             file_lines = f.read()
-            self.traj_names = file_lines.split("\n")
-        if "" in self.traj_names:
-            self.traj_names.remove("")
-
-        # Filter out trajectories whose traj_data.pkl is missing in data_folder to avoid crashes at startup.
-        filtered_trajs = []
-        missing_trajs = []
-        for name in self.traj_names:
-            traj_pkl = os.path.join(data_folder, name, "traj_data.pkl")
-            if os.path.exists(traj_pkl):
-                filtered_trajs.append(name)
+            all_traj_names = file_lines.split("\n")
+        if "" in all_traj_names:
+            all_traj_names.remove("")
+        # 过滤掉在data_folder下不存在的轨迹名
+        filtered_traj_names = []
+        missing_traj_names = []
+        for name in all_traj_names:
+            traj_dir = os.path.join(self.data_folder, name)
+            if os.path.isdir(traj_dir):
+                filtered_traj_names.append(name)
             else:
-                missing_trajs.append(traj_pkl)
-        if missing_trajs:
-            print(f"[Warning] Skipping {len(missing_trajs)} trajectories missing traj_data.pkl. Example: {missing_trajs[:3]}")
-        self.traj_names = filtered_trajs
+                missing_traj_names.append(name)
+        if missing_traj_names:
+            print(f"[Warning] The following trajectories listed in {traj_names_file} are missing in {self.data_folder} and will be skipped: {missing_traj_names}")
+        self.traj_names = filtered_traj_names
+        if not self.traj_names:
+            raise RuntimeError(f"No valid trajectory names found in {traj_names_file} after filtering missing ones.")
 
         self.image_size = image_size
         self.distance_categories = list(range(min_dist_cat, max_dist_cat + 1))
@@ -90,12 +95,26 @@ class BaseDataset(Dataset):
     def _load_index(self, predefined_index) -> None:
         """
         Generates a list of tuples of (obs_traj_name, goal_traj_name, obs_time, goal_time) for each observation in the dataset
-        Always builds index from traj_names.txt, no predefined index used
         """
-        print("****** Building index from traj_names.txt... ******")
-        # 总是从traj_names.txt构建index，不使用任何预定义或预生成的index
-        self.index_to_data, self.goals_index = self._build_index()
-        print(f"****** Index built successfully with {len(self.index_to_data)} samples ******")
+        if predefined_index:
+            print(f"****** Using a predefined evaluation index... {predefined_index}******")
+            with open(predefined_index, "rb") as f:
+                self.index_to_data = pickle.load(f)
+                return
+        else:
+            print("****** Evaluating from NON PREDEFINED index... ******")
+            # 缓存索引文件到本地可写目录，避免只读目录写入权限问题
+            os.makedirs("/home/lih2511/GDiT/data", exist_ok=True)
+            index_to_data_path = os.path.join(
+                "/home/lih2511/GDiT/data",
+                f"{self.dataset_name}_dataset_dist_{self.min_dist_cat}_to_{self.max_dist_cat}_n{self.context_size}_len_traj_pred_{self.len_traj_pred}.pkl",
+            )
+            self.index_to_data, self.goals_index = self._build_index()
+            try:
+                with open(index_to_data_path, "wb") as f:
+                    pickle.dump((self.index_to_data, self.goals_index), f)
+            except Exception as e:
+                print(f"[Warning] Failed to write index cache to {index_to_data_path}: {e}")
 
     def _build_index(self, use_tqdm: bool = False):
         """

@@ -1,7 +1,3 @@
-import sys, os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "InfiniteVGGT/src")))
-# --------------------------------------------------------
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -12,14 +8,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "Infinit
 # NoMaD, GNM, ViNT: https://github.com/robodhruv/visualnav-transformer
 # --------------------------------------------------------
 
+from isolated_nwm_infer import model_forward_wrapper
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-import vggt_utils
-
-# Import after torch has initialized to avoid circular import with multiprocessing
-from isolated_nwm_infer import model_forward_wrapper
 
 import matplotlib
 matplotlib.use('Agg')
@@ -33,7 +26,10 @@ import matplotlib.pyplot as plt
 import yaml
 
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data.distributed import DistributedSampler
 from diffusers.models import AutoencoderKL
 
 from distributed import init_distributed
@@ -56,34 +52,39 @@ def update_ema(ema_model, model, decay=0.9999):
 
     for name, param in model_params.items():
         name = name.replace('_orig_mod.', '')
-        # Ensure parameter tensors are on same device before in-place update.
-        ema_p = ema_params[name]
-        param_data = param.data
-        if param_data.device != ema_p.device:
-            param_data = param_data.detach().to(ema_p.device)
-        ema_p.mul_(decay).add_(param_data, alpha=1 - decay)
+        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
 def requires_grad(model, flag=True):
     """
     Set requires_grad flag for all parameters in a model.
     """
-
     for p in model.parameters():
         p.requires_grad = flag
+
+
+def cleanup():
+    """
+    End DDP training.
+    """
+    dist.destroy_process_group()
 
 
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format='[\033[34m%(asctime)s\033[0m] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-    )
-    logger = logging.getLogger(__name__)
+    if dist.get_rank() == 0:  # real logger
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[\033[34m%(asctime)s\033[0m] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+        )
+        logger = logging.getLogger(__name__)
+    else:  # dummy logger (does nothing)
+        logger = logging.getLogger(__name__)
+        logger.addHandler(logging.NullHandler())
     return logger
 
 #################################################################################
@@ -95,12 +96,17 @@ def main(args):
     Trains a new CDiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    torch.manual_seed(args.global_seed)
-    print(f"Starting single-process multi-GPU training, seed={args.global_seed}.")
+
+    # Setup DDP:
+    _, rank, device, _ = init_distributed()
+    # rank = dist.get_rank()
+    seed = args.global_seed * dist.get_world_size() + rank
+    torch.manual_seed(seed)
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
     with open("config/eval_config.yaml", "r") as f:
         default_config = yaml.safe_load(f)
     config = default_config
+    
     with open(args.config, "r") as f:
         user_config = yaml.safe_load(f)
     config.update(user_config)
@@ -109,53 +115,23 @@ def main(args):
     os.makedirs(config['results_dir'], exist_ok=True)  # Make results folder (holds all experiment subfolders)
     experiment_dir = f"{config['results_dir']}/{config['run_name']}"  # Create an experiment folder
     checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    logger = create_logger(experiment_dir)
-    logger.info(f"Experiment directory created at {experiment_dir}")
+    if rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger = create_logger(experiment_dir)
+        logger.info(f"Experiment directory created at {experiment_dir}")
+    else:
+        logger = create_logger(None)
 
     # Create model:
-    # Load VAE (tokenizer) on CPU to save GPU memory. It will be moved to GPU briefly when encoding.
-    tokenizer = AutoencoderKL.from_pretrained(
-        "config/cdit_b/checkpoints/sd-vae-ema",
-        local_files_only=True
-    ).cpu()
+    tokenizer = AutoencoderKL.from_pretrained("/home/lih2511/GDiT/config/cdit_l/checkpoints/sd-vae-ema", local_files_only=True).to(device)
     latent_size = config['image_size'] // 8
 
     assert config['image_size'] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     num_cond = config['context_size']
+    model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4).to(device)
     
-    # Get VGGT config
-    vggt_config = config.get('vggt', {})
-    use_kv_cache = vggt_config.get('use_kv_cache', False)
-    kv_cache_dim = vggt_config.get('kv_cache_dim', None) if use_kv_cache else None
-    kv_cross_attn_start_layer = vggt_config.get('kv_cross_attn_start_layer', 16)
-    
-    model = CDiT_models[config['model']](
-        context_size=num_cond, 
-        input_size=latent_size, 
-        in_channels=4,
-        kv_cache_dim=kv_cache_dim,
-        kv_cross_attn_start_layer=kv_cross_attn_start_layer
-    ).to(device)
-    # Keep EMA on CPU to reduce GPU memory压力. update_ema handles device differences.
-    ema = deepcopy(model).cpu()
+    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    
-    # Load VGGT model if using KV cache
-    vggt_model = None
-    if use_kv_cache:
-        vggt_checkpoint = vggt_config.get('checkpoint', '')
-        vggt_img_size = vggt_config.get('img_size', 518)
-        vggt_patch_size = vggt_config.get('patch_size', 14)
-        vggt_embed_dim = vggt_config.get('kv_cache_dim', 1024)
-        
-        vggt_model = vggt_utils.load_vggt_model(
-            checkpoint_path=vggt_checkpoint,
-            img_size=vggt_img_size,
-            patch_size=vggt_patch_size,
-            embed_dim=vggt_embed_dim
-        )
-        logger.info(f"Loaded VGGT model for KV cache extraction")
     
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     lr = float(config.get('lr', 1e-4))
@@ -175,8 +151,7 @@ def main(args):
             raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
         latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
         print("Loading model from ", latest_path)
-        # Load checkpoint to CPU to avoid allocating large GPU tensors unexpectedly
-        latest_checkpoint = torch.load(latest_path, map_location='cpu', weights_only=False) 
+        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False) 
 
         if "model" in latest_checkpoint:
             model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
@@ -203,19 +178,10 @@ def main(args):
         if "scaler" in latest_checkpoint:
             scaler.load_state_dict(latest_checkpoint["scaler"])
         
-    # Handle new command-line arguments
-    if args.batch_size is not None:
-        config['batch_size'] = args.batch_size
-    if args.no_compile:
-        args.torch_compile = 0
-    
     # ~40% speedup but might leads to worse performance depending on pytorch version
     if args.torch_compile:
         model = torch.compile(model)
-    # 多卡自动分配
-    if torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs via DataParallel.")
-        model = torch.nn.DataParallel(model)
+    model = DDP(model, device_ids=[device])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -269,10 +235,18 @@ def main(args):
     train_dataset = ConcatDataset(train_dataset)
     test_dataset = ConcatDataset(test_dataset)
 
+    sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=dist.get_world_size(),
+        rank=rank,
+        shuffle=True,
+        seed=args.global_seed
+    )
     loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
-        shuffle=True,
+        shuffle=False,
+        sampler=sampler,
         num_workers=config['num_workers'],
         pin_memory=True,
         drop_last=True,
@@ -291,6 +265,7 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
+        sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
 
         for x, y, rel_t in loader:
@@ -300,48 +275,27 @@ def main(args):
             
             with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
                 with torch.no_grad():
-                    x_original = x.clone()  # Keep original for VGGT
                     # Map input images to latent space + normalize latents:
                     B, T = x.shape[:2]
                     x = x.flatten(0,1)
-
-                    # Temporarily move tokenizer to GPU for encoding, then move latents back to CPU
-                    # to free GPU memory immediately.
-                    # Calculate number of goals first since it's needed for KV cache processing
-                    num_goals = T - num_cond
-                    
-                    # Extract KV cache from VGGT if enabled
-                    kv_cache = None
-                    if use_kv_cache and vggt_model is not None:
-                        # Use conditional frames for KV cache extraction
-                        cond_images = x_original[:, :num_cond]  # [B, num_cond, C, H, W]
-                        keep_ratio = vggt_config.get('keep_ratio', 0.5)
-                        prune_method = vggt_config.get('prune_method', 'attention')
-                        vggt_img_size = vggt_config.get('img_size', 518)
-                        # --- 将VGGT临时转到GPU ---
-                        vggt_model.to(device)
-                        kv_cache = vggt_utils.prepare_kv_cache(
-                            vggt_model, 
-                            cond_images, 
-                            keep_ratio=keep_ratio,
-                            prune_method=prune_method,
-                            vggt_img_size=vggt_img_size
-                        )  # [B, num_cond, N_pruned, embed_dim]
-                        # 用完立即转回CPU并清理显存
-                        vggt_model.to("cpu")
-                        torch.cuda.empty_cache()
-                        # Flatten sequence dimension: [B, num_cond, N_pruned, embed_dim] -> [B, num_cond*N_pruned, embed_dim]
-                        kv_cache = kv_cache.flatten(1, 2)
-                        # Expand KV cache for all goals
-                        kv_cache = kv_cache.unsqueeze(1).expand(B, num_goals, -1, -1).flatten(0, 1)
-                        # [B, num_cond*N_pruned, embed_dim] -> [B, num_goals, num_cond*N_pruned, embed_dim] -> [B*num_goals, num_cond*N_pruned, embed_dim]
+                    x = tokenizer.encode(x).latent_dist.sample().mul_(0.18215)
+                    x = x.unflatten(0, (B, T))
+                
+                num_goals = T - num_cond
                 x_start = x[:, num_cond:].flatten(0, 1)
-                x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+                # 兼容4D/5D输入，自动适配x_cond shape
+                if x.dim() == 5:
+                    # [B, T, C, H, W]，标准视频/图像输入
+                    x_cond = x[:, :num_cond].reshape(-1, *x.shape[2:])
+                elif x.dim() == 4:
+                    # [B, T, D, F] 或类似结构
+                    x_cond = x[:, :num_cond].reshape(-1, *x.shape[2:])
+                else:
+                    raise ValueError(f"Unexpected input x shape: {x.shape}")
                 y = y.flatten(0, 1)
                 rel_t = rel_t.flatten(0, 1)
-                
                 t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
-                model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t, kv_cache=kv_cache)
+                model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
                 loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
                 loss = loss_dict["loss"].mean()
 
@@ -357,7 +311,7 @@ def main(args):
                 scaler.step(opt)
                 scaler.update()
             
-            update_ema(ema, model.module if hasattr(model, 'module') else model)
+            update_ema(ema, model.module)
 
             # Log loss values:
             running_loss += loss.detach().item()
@@ -368,8 +322,11 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                samples_per_sec = x_cond.shape[0]*steps_per_sec
-                avg_loss = running_loss / log_steps
+                samples_per_sec = dist.get_world_size()*x_cond.shape[0]*steps_per_sec
+                # Reduce loss history over all processes:
+                avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
@@ -378,52 +335,54 @@ def main(args):
 
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                checkpoint = {
-                    "model": model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
-                    "ema": ema.state_dict(),
-                    "opt": opt.state_dict(),
-                    "args": args,
-                    "epoch": epoch,
-                    "train_steps": train_steps
-                }
-                if bfloat_enable:
-                    checkpoint.update({"scaler": scaler.state_dict()})
-                checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
-                torch.save(checkpoint, checkpoint_path)
-                if train_steps % (10*args.ckpt_every) == 0 and train_steps > 0:
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pth.tar"
+                if rank == 0:
+                    checkpoint = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "args": args,
+                        "epoch": epoch,
+                        "train_steps": train_steps
+                    }
+                    if bfloat_enable:
+                        checkpoint.update({"scaler": scaler.state_dict()})
+                    checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
                     torch.save(checkpoint, checkpoint_path)
-                logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    if train_steps % (10*args.ckpt_every) == 0 and train_steps > 0:
+                        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pth.tar"
+                        torch.save(checkpoint, checkpoint_path)
+                    logger.info(f"Saved checkpoint to {checkpoint_path}")
             
             if train_steps % args.eval_every == 0 and train_steps > 0:
                 eval_start_time = time()
                 save_dir = os.path.join(experiment_dir, str(train_steps))
-                # Move EMA to device temporarily for evaluation to avoid keeping it on GPU full-time
-                try:
-                    ema.to(device)
-                    sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond, vggt_model, vggt_config, use_kv_cache)
-                finally:
-                    # Move EMA back to CPU and free GPU memory
-                    try:
-                        ema.to('cpu')
-                    except Exception:
-                        pass
-                    torch.cuda.empty_cache()
+                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond)
+                dist.barrier()
                 eval_end_time = time()
                 eval_time = eval_end_time - eval_start_time
                 logger.info(f"(step={train_steps:07d}) Perceptual Loss: {sim_score:.4f}, Eval Time: {eval_time:.2f}")
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+
     logger.info("Done!")
+    cleanup()
 
 
-@torch.no_grad()
-def evaluate(model, vae, diffusion, test_dataloaders, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond, vggt_model=None, vggt_config=None, use_kv_cache=False):
+@torch.no_grad
+def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond):
+    sampler = DistributedSampler(
+        test_dataloaders,
+        num_replicas=dist.get_world_size(),
+        rank=rank,
+        shuffle=True,
+        seed=seed
+    )
     loader = DataLoader(
         test_dataloaders,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True
@@ -441,24 +400,7 @@ def evaluate(model, vae, diffusion, test_dataloaders, batch_size, num_workers, l
         with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
             B, T = x.shape[:2]
             num_goals = T - num_cond
-            # Ensure VAE (vae) is on device for model_forward_wrapper, move back to CPU afterwards.
-            vae_moved = False
-            try:
-                if next(vae.parameters()).device != device:
-                    vae.to(device)
-                    vae_moved = True
-            except Exception:
-                # If vae has no parameters or move fails, ignore and proceed
-                pass
-
-            samples = model_forward_wrapper((model, diffusion, vae), x, y, num_timesteps=None, latent_size=latent_size, device=device, num_cond=num_cond, num_goals=num_goals, rel_t=rel_t, vggt_model=vggt_model, vggt_config=vggt_config, use_kv_cache=use_kv_cache)
-            # Move VAE back to CPU to save GPU memory if we moved it here
-            if vae_moved:
-                try:
-                    vae.to('cpu')
-                except Exception:
-                    pass
-                torch.cuda.empty_cache()
+            samples = model_forward_wrapper((model, diffusion, vae), x, y, num_timesteps=None, latent_size=latent_size, device=device, num_cond=num_cond, num_goals=num_goals, rel_t=rel_t)
             x_start_pixels = x[:, num_cond:].flatten(0, 1)
             x_cond_pixels = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
             samples = samples * 0.5 + 0.5
@@ -469,22 +411,25 @@ def evaluate(model, vae, diffusion, test_dataloaders, batch_size, num_workers, l
             n_samples += len(res)
         break
     
-    os.makedirs(save_dir, exist_ok=True)
-    for i in range(min(samples.shape[0], 10)):
-        _, ax = plt.subplots(1,3,dpi=256)
-        ax[0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
-        ax[1].imshow((x_start_pixels[i].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
-        ax[2].imshow((samples[i].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
-        plt.savefig(f'{save_dir}/{i}.png')
-        plt.close()
+    if rank == 0:
+        os.makedirs(save_dir, exist_ok=True)
+        for i in range(min(samples.shape[0], 10)):
+            _, ax = plt.subplots(1,3,dpi=256)
+            ax[0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
+            ax[1].imshow((x_start_pixels[i].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
+            ax[2].imshow((samples[i].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+            plt.savefig(f'{save_dir}/{i}.png')
+            plt.close()
 
+    dist.all_reduce(score)
+    dist.all_reduce(n_samples)
     sim_score = score/n_samples
     return sim_score
 
 def get_args_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--epochs", type=int, default=100)
     # parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=100)
@@ -492,10 +437,6 @@ def get_args_parser():
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--bfloat16", type=int, default=1)
     parser.add_argument("--torch-compile", type=int, default=1)
-    # Added for compatibility with existing training scripts
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--no_compile", action="store_true")
-    parser.add_argument("--grad_ckpt", action="store_true")
     return parser
 
 if __name__ == "__main__":

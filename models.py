@@ -227,7 +227,7 @@ class CDiT(nn.Module):
     ):
         super().__init__()
         self.context_size = context_size
-        self.learn_sigma = learn_sigma
+        self.max_patches = 4096  # 默认最大支持4096个patch
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
@@ -348,18 +348,33 @@ class CDiT(nn.Module):
         x = self.x_embedder(x)  # (N, num_patches, D)
         
         # Embed context frames
-        x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1]))  # (N, context_size, num_patches, D)
-        x_cond = x_cond.flatten(1, 2)  # (N, context_size * num_patches, D)
-        
-        # Concatenate context and current frame tokens
-        x = torch.cat([x_cond, x], dim=1)  # (N, (context_size + 1) * num_patches, D)
+        if x_cond.dim() == 5:
+            # [N, context_size, C, H, W]
+            x_cond_embed = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1]))  # (N, context_size, num_patches, D)
+            x_cond_embed = x_cond_embed.flatten(1, 2)  # (N, context_size * num_patches, D)
+        elif x_cond.dim() == 4:
+            if x_cond.shape[0] == x.shape[0]:
+                # context_size=1，直接送入
+                x_cond_embed = self.x_embedder(x_cond)  # (N, num_patches, D)
+            else:
+                # [N*context_size, C, H, W]，需要reshape回[N, context_size, ...]
+                N = x.shape[0]
+                context_size = x_cond.shape[0] // N
+                x_cond_embed = self.x_embedder(x_cond).unflatten(0, (N, context_size)).flatten(1, 2)
+        else:
+            raise ValueError(f"Unexpected x_cond shape: {x_cond.shape}")
+
+        # 拼接 patchify 后的 context 和当前帧 tokens
+        x = torch.cat([x_cond_embed, x], dim=1)  # (N, (context_size + 1) * num_patches, D)
         
         # Generate positions for all tokens (context + current)
-        # Each frame has the same spatial layout, so we repeat positions
+        # 自动推断 context_size，确保与 token 数量严格一致
+        num_patches = self.x_embedder.num_patches
+        total_tokens = x.shape[1]  # 拼接后 token 数量
+        context_size = (total_tokens // num_patches) - 1
         positions = self.position_getter(batch_size, h, w, x.device)  # (N, num_patches, 2)
-        # Repeat for context_size + 1 frames
-        positions = positions.unsqueeze(1).repeat(1, self.context_size + 1, 1, 1)  # (N, context_size+1, num_patches, 2)
-        positions = positions.flatten(1, 2)  # (N, (context_size+1)*num_patches, 2)
+        positions = positions.unsqueeze(1).repeat(1, context_size + 1, 1, 1)  # (N, context_size+1, num_patches, 2)
+        positions = positions.flatten(1, 2)  # (N, total_tokens, 2)
         
         # Project KV cache to match hidden dimension if needed
         if kv_cache is not None and self.kv_cache_proj is not None:
