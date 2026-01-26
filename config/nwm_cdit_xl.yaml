@@ -2,7 +2,7 @@ run_name: nwm_cdit_l
 
 vggt:
   use_kv_cache: true
-  checkpoint: /home/JJ_Group/lih2511/GDiT/InfiniteVGGT/ckpt/checkpoints.pth
+  checkpoint: /home/lih2511/GDiT/InfiniteVGGT/ckpt/checkpoints.pth
   img_size: 518
   patch_size: 14
   kv_cache_dim: 1024
@@ -13,10 +13,13 @@ vggt:
 # training setup
 results_dir: logs
 train: True
-batch_size: 1
-num_workers: 8
-model: CDiT-L/2
+batch_size: 16
+num_workers: 12
+model: CDiT-B/2
 lr: 8e-5
+learn_sigma: true
+allow_sigma_mismatch: false
+from_checkpoint: config/cdit_b/checkpoints/0100000.pth.tar
 
 # normalization for the action space
 normalize: True
@@ -35,7 +38,22 @@ len_traj_pred: 64
 image_size: 224
 datasets:
   recon:
-    data_folder: /home/JJ_Group/lih2511/GDiT/nwm/data/recon/train/  # 指向实际数据文件
-    train: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/train/  # 指向traj_names.txt文件
-    test: /home/JJ_Group/lih2511/GDiT/nwm/data_splits/recon/test/  # 指向测试traj_names.txt文件
+    data_folder: /data11/yangyf2505/nwm/data/recon
+    train: data_splits/recon/train/ # path to train folder with traj_names.txt
+    test: data_splits/recon/test/ # path to test folder with traj_names.txt
+    goals_per_obs: 4
+  tartan_drive:
+    data_folder: /data/data/yangyf2505/nwm/data/tartandrive
+    train: data_splits/tartan_drive/train/
+    test: data_splits/tartan_drive/test/
+    goals_per_obs: 4
+  sacson:
+    data_folder: /data11/yangyf2505/nwm/data/sacson
+    train: data_splits/sacson/train
+    test: data_splits/sacson/test
+    goals_per_obs: 4
+  scand:
+    data_folder: /data11/yangyf2505/nwm/data/scand
+    train: data_splits/scand/train
+    test: data_splits/scand/test
     goals_per_obs: 4

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 # Add InfiniteVGGT to path
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "InfiniteVGGT", "src")
+    0, os.path.join(os.path.dirname(__file__), "InfiniteVGGT", "src")
 )
 
 from vggt.models.vggt import VGGT

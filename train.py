@@ -1,3 +1,7 @@
+import sys, os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "InfiniteVGGT/src")))
+# --------------------------------------------------------
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
@@ -29,10 +33,7 @@ import matplotlib.pyplot as plt
 import yaml
 
 
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, ConcatDataset
-from torch.utils.data.distributed import DistributedSampler
 from diffusers.models import AutoencoderKL
 
 from distributed import init_distributed
@@ -67,32 +68,22 @@ def requires_grad(model, flag=True):
     """
     Set requires_grad flag for all parameters in a model.
     """
+
     for p in model.parameters():
         p.requires_grad = flag
-
-
-def cleanup():
-    """
-    End DDP training.
-    """
-    dist.destroy_process_group()
 
 
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-        )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[\033[34m%(asctime)s\033[0m] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+    )
+    logger = logging.getLogger(__name__)
     return logger
 
 #################################################################################
@@ -104,17 +95,12 @@ def main(args):
     Trains a new CDiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
-
-    # Setup DDP:
-    _, rank, device, _ = init_distributed()
-    # rank = dist.get_rank()
-    seed = args.global_seed * dist.get_world_size() + rank
-    torch.manual_seed(seed)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(args.global_seed)
+    print(f"Starting single-process multi-GPU training, seed={args.global_seed}.")
     with open("config/eval_config.yaml", "r") as f:
         default_config = yaml.safe_load(f)
     config = default_config
-    
     with open(args.config, "r") as f:
         user_config = yaml.safe_load(f)
     config.update(user_config)
@@ -123,17 +109,14 @@ def main(args):
     os.makedirs(config['results_dir'], exist_ok=True)  # Make results folder (holds all experiment subfolders)
     experiment_dir = f"{config['results_dir']}/{config['run_name']}"  # Create an experiment folder
     checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-    if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
-        logger.info(f"Experiment directory created at {experiment_dir}")
-    else:
-        logger = create_logger(None)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    logger = create_logger(experiment_dir)
+    logger.info(f"Experiment directory created at {experiment_dir}")
 
     # Create model:
     # Load VAE (tokenizer) on CPU to save GPU memory. It will be moved to GPU briefly when encoding.
     tokenizer = AutoencoderKL.from_pretrained(
-        "/home/JJ_Group/lih2511/GDiT/nwm/config/cdit_xl/checkpoints/sd-vae-ema",
+        "config/cdit_b/checkpoints/sd-vae-ema",
         local_files_only=True
     ).cpu()
     latent_size = config['image_size'] // 8
@@ -154,8 +137,7 @@ def main(args):
         kv_cache_dim=kv_cache_dim,
         kv_cross_attn_start_layer=kv_cross_attn_start_layer
     ).to(device)
-    
-    # Keep EMA on CPU to reduce GPU memory pressure. update_ema handles device differences.
+    # Keep EMA on CPU to reduce GPU memory压力. update_ema handles device differences.
     ema = deepcopy(model).cpu()
     requires_grad(ema, False)
     
@@ -230,7 +212,10 @@ def main(args):
     # ~40% speedup but might leads to worse performance depending on pytorch version
     if args.torch_compile:
         model = torch.compile(model)
-    model = DDP(model, device_ids=[device])
+    # 多卡自动分配
+    if torch.cuda.device_count() > 1:
+        logger.info(f"Using {torch.cuda.device_count()} GPUs via DataParallel.")
+        model = torch.nn.DataParallel(model)
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -284,18 +269,10 @@ def main(args):
     train_dataset = ConcatDataset(train_dataset)
     test_dataset = ConcatDataset(test_dataset)
 
-    sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
     loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
-        shuffle=False,
-        sampler=sampler,
+        shuffle=True,
         num_workers=config['num_workers'],
         pin_memory=True,
         drop_last=True,
@@ -314,7 +291,6 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
 
         for x, y, rel_t in loader:
@@ -331,19 +307,6 @@ def main(args):
 
                     # Temporarily move tokenizer to GPU for encoding, then move latents back to CPU
                     # to free GPU memory immediately.
-                    try:
-                        tokenizer.to(device)
-                        x_latent = tokenizer.encode(x).latent_dist.sample().mul_(0.18215)
-                        # keep latents on the same device as the model (GPU) so downstream tensors stay on same device
-                        x = x_latent.unflatten(0, (B, T))
-                    finally:
-                        # Move tokenizer back to CPU and clear cache. Do NOT move latents to CPU.
-                        try:
-                            tokenizer.to('cpu')
-                        except Exception:
-                            pass
-                        torch.cuda.empty_cache()
-                    
                     # Calculate number of goals first since it's needed for KV cache processing
                     num_goals = T - num_cond
                     
@@ -394,7 +357,7 @@ def main(args):
                 scaler.step(opt)
                 scaler.update()
             
-            update_ema(ema, model.module)
+            update_ema(ema, model.module if hasattr(model, 'module') else model)
 
             # Log loss values:
             running_loss += loss.detach().item()
@@ -405,11 +368,8 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                samples_per_sec = dist.get_world_size()*x_cond.shape[0]*steps_per_sec
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
+                samples_per_sec = x_cond.shape[0]*steps_per_sec
+                avg_loss = running_loss / log_steps
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
@@ -418,23 +378,22 @@ def main(args):
 
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args,
-                        "epoch": epoch,
-                        "train_steps": train_steps
-                    }
-                    if bfloat_enable:
-                        checkpoint.update({"scaler": scaler.state_dict()})
-                    checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
+                checkpoint = {
+                    "model": model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
+                    "ema": ema.state_dict(),
+                    "opt": opt.state_dict(),
+                    "args": args,
+                    "epoch": epoch,
+                    "train_steps": train_steps
+                }
+                if bfloat_enable:
+                    checkpoint.update({"scaler": scaler.state_dict()})
+                checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
+                torch.save(checkpoint, checkpoint_path)
+                if train_steps % (10*args.ckpt_every) == 0 and train_steps > 0:
+                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pth.tar"
                     torch.save(checkpoint, checkpoint_path)
-                    if train_steps % (10*args.ckpt_every) == 0 and train_steps > 0:
-                        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pth.tar"
-                        torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
             
             if train_steps % args.eval_every == 0 and train_steps > 0:
                 eval_start_time = time()
@@ -442,7 +401,7 @@ def main(args):
                 # Move EMA to device temporarily for evaluation to avoid keeping it on GPU full-time
                 try:
                     ema.to(device)
-                    sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond, vggt_model, vggt_config, use_kv_cache)
+                    sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond, vggt_model, vggt_config, use_kv_cache)
                 finally:
                     # Move EMA back to CPU and free GPU memory
                     try:
@@ -450,32 +409,21 @@ def main(args):
                     except Exception:
                         pass
                     torch.cuda.empty_cache()
-                dist.barrier()
                 eval_end_time = time()
                 eval_time = eval_end_time - eval_start_time
                 logger.info(f"(step={train_steps:07d}) Perceptual Loss: {sim_score:.4f}, Eval Time: {eval_time:.2f}")
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
-
     logger.info("Done!")
-    cleanup()
 
 
-@torch.no_grad
-def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond, vggt_model=None, vggt_config=None, use_kv_cache=False):
-    sampler = DistributedSampler(
-        test_dataloaders,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=seed
-    )
+@torch.no_grad()
+def evaluate(model, vae, diffusion, test_dataloaders, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond, vggt_model=None, vggt_config=None, use_kv_cache=False):
     loader = DataLoader(
         test_dataloaders,
         batch_size=batch_size,
-        shuffle=False,
-        sampler=sampler,
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True
@@ -521,18 +469,15 @@ def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_work
             n_samples += len(res)
         break
     
-    if rank == 0:
-        os.makedirs(save_dir, exist_ok=True)
-        for i in range(min(samples.shape[0], 10)):
-            _, ax = plt.subplots(1,3,dpi=256)
-            ax[0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
-            ax[1].imshow((x_start_pixels[i].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
-            ax[2].imshow((samples[i].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
-            plt.savefig(f'{save_dir}/{i}.png')
-            plt.close()
+    os.makedirs(save_dir, exist_ok=True)
+    for i in range(min(samples.shape[0], 10)):
+        _, ax = plt.subplots(1,3,dpi=256)
+        ax[0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
+        ax[1].imshow((x_start_pixels[i].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
+        ax[2].imshow((samples[i].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+        plt.savefig(f'{save_dir}/{i}.png')
+        plt.close()
 
-    dist.all_reduce(score)
-    dist.all_reduce(n_samples)
     sim_score = score/n_samples
     return sim_score
 
